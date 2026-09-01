@@ -1,0 +1,1316 @@
+--[[
+	DoctorStrangeLocalScript (LocalScript)
+	Local no Explorer: StarterPlayer/StarterPlayerScripts/DoctorStrangeLocalScript
+	(também funciona colocado direto em StarterCharacterScripts ou StarterGui, contanto que rode no cliente)
+
+	Sistema completo do Doutor Estranho em UM ÚNICO LocalScript:
+	  - Portal com câmera de seleção de destino
+	  - Escudo Místico, Magia das Mãos, Rajada, Chicote, Projeção Astral,
+	    Duplicação Ilusória, Feitiço Supremo
+	  - GUI (PC + mobile) construída inteiramente por código
+	  - Cooldowns
+
+	IMPORTANTE (leia antes de usar em jogo com outros jogadores):
+	Este é um script 100% client-side, sem RemoteEvents e sem servidor.
+	Isso significa:
+	  ✔ Mover/teleportar o SEU PRÓPRIO personagem (Portal, Projeção
+	    Astral) funciona normalmente e replica para os outros.
+	  ✔ Efeitos visuais (círculos, escudo, portais, clones) funcionam
+	    perfeitamente para todos verem.
+	  ⚠ Aplicar dano em OUTROS jogadores (Rajada, Chicote, Supremo) é
+	    feito localmente (best-effort) — o Roblox não deixa um cliente
+	    alterar com segurança o Health de outro jogador sem um Script
+	    no servidor validando. Funciona bem para testes/solo/RP, mas
+	    não é à prova de exploit em um jogo PvP real. Se precisar de
+	    dano validado de verdade, esse ponto exige um Script rodando
+	    em ServerScriptService.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+----------------------------------------------------------------
+-- 1) CONFIGURAÇÃO (texturas, teclas, parâmetros do portal)
+----------------------------------------------------------------
+local ASSET_IDS = {
+	MagicCircle = "rbxassetid://97813473235022",
+	Shield = "rbxassetid://129694421014636",
+	Portal = "rbxassetid://114643138336075",
+}
+
+local KEYBINDS = {
+	Portal = Enum.KeyCode.Q,
+	Shield = Enum.KeyCode.E,
+	MagicHands = Enum.KeyCode.R,
+	Blast = Enum.KeyCode.F,
+	Whip = Enum.KeyCode.Z,
+	Astral = Enum.KeyCode.X,
+	Illusion = Enum.KeyCode.C,
+	Ultimate = Enum.KeyCode.V,
+}
+
+local FLYCAM_KEYS = {
+	Up = Enum.KeyCode.Space,
+	Down = Enum.KeyCode.LeftControl,
+	Boost = Enum.KeyCode.LeftShift,
+}
+
+local ABILITY_ORDER = { "Portal", "Shield", "MagicHands", "Blast", "Whip", "Astral", "Illusion", "Ultimate" }
+
+local ABILITY_DISPLAY = {
+	Portal = { Icon = "🌀", Name = "Portal" },
+	Shield = { Icon = "🛡️", Name = "Escudo" },
+	MagicHands = { Icon = "✨", Name = "Magia" },
+	Blast = { Icon = "💥", Name = "Rajada" },
+	Whip = { Icon = "🔥", Name = "Chicote" },
+	Astral = { Icon = "👻", Name = "Astral" },
+	Illusion = { Icon = "🌀", Name = "Ilusão" },
+	Ultimate = { Icon = "🔮", Name = "Supremo" },
+}
+
+local PORTAL_CFG = {
+	MaxDistance = 150,
+	FlyCamSpeed = 60,
+	FlyCamBoostSpeed = 140,
+	FlyCamVerticalSpeed = 45,
+	FlyCamLookSensitivity = 0.35,
+	GroundCheckTolerance = 6,
+	MinWalkableNormalY = 0.6,
+	ObstructionCheckSize = Vector3.new(4, 6, 4),
+	OriginOffset = 4,
+	OriginHeight = 3,
+	PortalHeight = 9,
+	EntryDetectionSize = Vector3.new(6, 8, 3),
+	PortalLifetime = 12,
+	ExitVisualLifetime = 6,
+}
+
+----------------------------------------------------------------
+-- 2) CONFIGURAÇÃO DAS HABILIDADES (cooldown, dano, alcance...)
+----------------------------------------------------------------
+local ABILITY_CFG = {
+	Portal = { Cooldown = 20 },
+	Shield = { Cooldown = 12, Duration = 6, DamageReduction = 1 },
+	MagicHands = { Cooldown = 3 },
+	Blast = { Cooldown = 5, Damage = 15, Range = 80, KnockbackForce = 45, MaxAngleDot = 0.5 },
+	Whip = { Cooldown = 6, Damage = 12, Range = 14, Radius = 6, KnockbackForce = 35 },
+	Astral = { Cooldown = 30, Duration = 8 },
+	Illusion = { Cooldown = 20, Duration = 6, CloneCount = 3, SpawnRadius = 10 },
+	Ultimate = { Cooldown = 90, PrepTime = 1.5, Radius = 22, Damage = 35, ImmobilizeTime = 3 },
+}
+
+----------------------------------------------------------------
+-- 3) EFEITOS VISUAIS (biblioteca interna)
+----------------------------------------------------------------
+local Effects = {}
+
+local spinning = {}
+RunService.Heartbeat:Connect(function(dt)
+	for part, speed in pairs(spinning) do
+		if part.Parent then
+			part.CFrame = part.CFrame * CFrame.Angles(0, math.rad(speed * dt), 0)
+		else
+			spinning[part] = nil
+		end
+	end
+end)
+
+function Effects.RegisterSpin(part, degreesPerSecond)
+	spinning[part] = degreesPerSecond
+end
+
+function Effects.UnregisterSpin(part)
+	spinning[part] = nil
+end
+
+-- Part padrão (Block) fino + Decal, evitando a ambiguidade das faces
+-- "redondas" do PartType.Cylinder (que ficam em Left/Right no Roblox).
+-- vertical=false -> disco deitado (Top/Bottom). vertical=true -> disco
+-- em pé, decal em Front/Back (Front = LookVector do CFrame recebido).
+function Effects.CreateCircle(cframe, diameter, color, vertical, textureId)
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Material = Enum.Material.Neon
+	part.Color = color
+	part.Transparency = 1
+	part.CFrame = cframe
+
+	local faces
+	if vertical then
+		part.Size = Vector3.new(diameter, diameter, 0.2)
+		faces = { Enum.NormalId.Front, Enum.NormalId.Back }
+	else
+		part.Size = Vector3.new(diameter, 0.2, diameter)
+		faces = { Enum.NormalId.Top, Enum.NormalId.Bottom }
+	end
+
+	local tex = textureId or ASSET_IDS.MagicCircle
+	for _, face in ipairs(faces) do
+		local decal = Instance.new("Decal")
+		decal.Texture = tex
+		decal.Face = face
+		decal.Transparency = 1
+		decal.Parent = part
+	end
+
+	part.Parent = workspace
+	return part
+end
+
+function Effects.FadeIn(part, duration, targetTransparency)
+	local goal = targetTransparency or 0.15
+	TweenService:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+		Transparency = goal,
+	}):Play()
+	for _, child in ipairs(part:GetChildren()) do
+		if child:IsA("Decal") then
+			TweenService:Create(child, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+				Transparency = 0,
+			}):Play()
+		end
+	end
+end
+
+function Effects.FadeOutAndDestroy(part, duration)
+	if not part or not part.Parent then
+		return
+	end
+	Effects.UnregisterSpin(part)
+	TweenService:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+		Transparency = 1,
+	}):Play()
+	for _, child in ipairs(part:GetChildren()) do
+		if child:IsA("Decal") then
+			TweenService:Create(child, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
+				Transparency = 1,
+			}):Play()
+		end
+	end
+	Debris:AddItem(part, duration + 0.1)
+end
+
+function Effects.EmitBurst(attachment, textureId, count, color)
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Texture = textureId or ASSET_IDS.MagicCircle
+	emitter.Color = ColorSequence.new(color)
+	emitter.Lifetime = NumberRange.new(0.4, 0.8)
+	emitter.Speed = NumberRange.new(4, 10)
+	emitter.Rotation = NumberRange.new(0, 360)
+	emitter.RotSpeed = NumberRange.new(-90, 90)
+	emitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	emitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.2),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	emitter.Rate = 0
+	emitter.Parent = attachment
+	emitter:Emit(count)
+	Debris:AddItem(emitter, 1.5)
+end
+
+function Effects.CreateImpactBolt(from, to, color, onArrive)
+	local part = Instance.new("Part")
+	part.Shape = Enum.PartType.Ball
+	part.Size = Vector3.new(1, 1, 1)
+	part.Material = Enum.Material.Neon
+	part.Color = color
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CFrame = CFrame.new(from)
+	part.Parent = workspace
+
+	local distance = (to - from).Magnitude
+	local duration = math.clamp(distance / 140, 0.05, 0.4)
+
+	local tween = TweenService:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+		CFrame = CFrame.new(to),
+	})
+	tween:Play()
+	tween.Completed:Connect(function()
+		if onArrive then
+			onArrive()
+		end
+		part:Destroy()
+	end)
+	Debris:AddItem(part, duration + 1)
+end
+
+function Effects.CreateImpactBurst(position, color, textureId)
+	local attachPart = Instance.new("Part")
+	attachPart.Size = Vector3.new(0.2, 0.2, 0.2)
+	attachPart.Transparency = 1
+	attachPart.Anchored = true
+	attachPart.CanCollide = false
+	attachPart.CanTouch = false
+	attachPart.CanQuery = false
+	attachPart.CFrame = CFrame.new(position)
+	attachPart.Parent = workspace
+
+	local attachment = Instance.new("Attachment", attachPart)
+	Effects.EmitBurst(attachment, textureId, 14, color)
+	Debris:AddItem(attachPart, 2)
+end
+
+function Effects.GetHand(character, isRight)
+	if isRight then
+		return character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm")
+	else
+		return character:FindFirstChild("LeftHand") or character:FindFirstChild("Left Arm")
+	end
+end
+
+function Effects.WeldTo(part, limb, offsetCFrame)
+	part.CFrame = limb.CFrame * (offsetCFrame or CFrame.new())
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = part
+	weld.Part1 = limb
+	weld.Parent = part
+	return weld
+end
+
+----------------------------------------------------------------
+-- 4) PERSONAGEM
+----------------------------------------------------------------
+local character = player.Character
+local humanoid, rootPart
+local savedWalkSpeed, savedJumpPower = 16, 50
+
+local function bindCharacter(char)
+	character = char
+	humanoid = char:WaitForChild("Humanoid")
+	rootPart = char:WaitForChild("HumanoidRootPart")
+	savedWalkSpeed = humanoid.WalkSpeed
+	savedJumpPower = humanoid.JumpPower
+end
+
+if character then
+	bindCharacter(character)
+end
+player.CharacterAdded:Connect(bindCharacter)
+
+----------------------------------------------------------------
+-- 5) GUI (construída por código)
+----------------------------------------------------------------
+local THEME = {
+	Bg = Color3.fromRGB(18, 14, 28),
+	Accent = Color3.fromRGB(255, 140, 30),
+	Accent2 = Color3.fromRGB(255, 200, 90),
+	Text = Color3.fromRGB(240, 235, 250),
+	Danger = Color3.fromRGB(255, 90, 90),
+}
+
+local function corner(inst, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 10)
+	c.Parent = inst
+end
+
+local function stroke(inst, thickness, color)
+	local s = Instance.new("UIStroke")
+	s.Thickness = thickness or 1.5
+	s.Color = color or THEME.Accent
+	s.Transparency = 0.2
+	s.Parent = inst
+end
+
+local isTouch = UserInputService.TouchEnabled
+local isKeyboard = UserInputService.KeyboardEnabled
+local playerGui = player:WaitForChild("PlayerGui")
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "DoctorStrangeGUI"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 25
+screenGui.Parent = playerGui
+
+-- Toast de mensagens
+local toast = Instance.new("TextLabel")
+toast.AnchorPoint = Vector2.new(0.5, 0)
+toast.Position = UDim2.new(0.5, 0, 0.08, 0)
+toast.Size = UDim2.new(0.7, 0, 0, 34)
+toast.BackgroundColor3 = THEME.Bg
+toast.BackgroundTransparency = 0.15
+toast.TextColor3 = THEME.Danger
+toast.Font = Enum.Font.GothamBold
+toast.TextSize = 16
+toast.Text = ""
+toast.Visible = false
+toast.ZIndex = 50
+toast.Parent = screenGui
+corner(toast, 8)
+stroke(toast, 1, THEME.Danger)
+
+local toastToken = 0
+local function showMessage(text, duration)
+	toastToken += 1
+	local myToken = toastToken
+	toast.Text = text
+	toast.Visible = true
+	task.delay(duration or 2, function()
+		if myToken == toastToken then
+			toast.Visible = false
+		end
+	end)
+end
+
+-- Barra de habilidades
+local abilityBar = Instance.new("Frame")
+abilityBar.AnchorPoint = Vector2.new(1, 1)
+abilityBar.Position = UDim2.new(1, -14, 1, -14)
+abilityBar.Size = UDim2.new(0, 264, 0, 128)
+abilityBar.BackgroundTransparency = 1
+abilityBar.Parent = screenGui
+
+local grid = Instance.new("UIGridLayout")
+grid.CellSize = UDim2.new(0, 60, 0, 60)
+grid.CellPadding = UDim2.new(0, 8, 0, 8)
+grid.FillDirectionMaxCells = 4
+grid.HorizontalAlignment = Enum.HorizontalAlignment.Right
+grid.VerticalAlignment = Enum.VerticalAlignment.Bottom
+grid.SortOrder = Enum.SortOrder.LayoutOrder
+grid.Parent = abilityBar
+
+local buttons = {}
+local cooldownData = {}
+
+local function handleAbilityInput(abilityName) end -- declarado antes, definido mais abaixo (forward declaration)
+
+for i, abilityName in ipairs(ABILITY_ORDER) do
+	local display = ABILITY_DISPLAY[abilityName]
+
+	local btn = Instance.new("TextButton")
+	btn.LayoutOrder = i
+	btn.BackgroundColor3 = THEME.Bg
+	btn.BackgroundTransparency = 0.1
+	btn.AutoButtonColor = false
+	btn.Text = ""
+	btn.Parent = abilityBar
+	corner(btn, 12)
+	stroke(btn, 1.5, THEME.Accent)
+
+	local icon = Instance.new("TextLabel")
+	icon.BackgroundTransparency = 1
+	icon.Size = UDim2.new(1, 0, 0.62, 0)
+	icon.Position = UDim2.new(0, 0, 0.02, 0)
+	icon.Text = display.Icon
+	icon.TextScaled = true
+	icon.Font = Enum.Font.GothamBold
+	icon.ZIndex = 2
+	icon.Parent = btn
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, 0, 0.3, 0)
+	label.Position = UDim2.new(0, 0, 0.68, 0)
+	label.Text = display.Name
+	label.TextColor3 = THEME.Text
+	label.Font = Enum.Font.Gotham
+	label.TextScaled = true
+	label.ZIndex = 2
+	label.Parent = btn
+
+	local fill = Instance.new("Frame")
+	fill.AnchorPoint = Vector2.new(0, 1)
+	fill.Position = UDim2.new(0, 0, 1, 0)
+	fill.Size = UDim2.new(1, 0, 0, 0)
+	fill.BackgroundColor3 = Color3.new(0, 0, 0)
+	fill.BackgroundTransparency = 0.35
+	fill.ZIndex = 3
+	fill.Visible = false
+	fill.Parent = btn
+	corner(fill, 12)
+
+	local timeLabel = Instance.new("TextLabel")
+	timeLabel.BackgroundTransparency = 1
+	timeLabel.Size = UDim2.new(1, 0, 1, 0)
+	timeLabel.Text = ""
+	timeLabel.TextColor3 = THEME.Text
+	timeLabel.Font = Enum.Font.GothamBold
+	timeLabel.TextScaled = true
+	timeLabel.ZIndex = 4
+	timeLabel.Parent = fill
+
+	btn.Activated:Connect(function()
+		handleAbilityInput(abilityName)
+	end)
+
+	buttons[abilityName] = { Button = btn, Fill = fill, TimeLabel = timeLabel }
+end
+
+RunService.RenderStepped:Connect(function()
+	for abilityName, data in pairs(cooldownData) do
+		local remaining = data.EndTime - os.clock()
+		local set = buttons[abilityName]
+		if remaining > 0 then
+			local ratio = math.clamp(remaining / data.Total, 0, 1)
+			set.Fill.Visible = true
+			set.Fill.Size = UDim2.new(1, 0, ratio, 0)
+			set.TimeLabel.Text = string.format("%.0f", math.ceil(remaining))
+			set.Button.Active = false
+		else
+			set.Fill.Visible = false
+			set.TimeLabel.Text = ""
+			set.Button.Active = true
+			cooldownData[abilityName] = nil
+		end
+	end
+end)
+
+local function setCooldown(abilityName, duration)
+	cooldownData[abilityName] = { EndTime = os.clock() + duration, Total = duration }
+end
+
+-- Tela de seleção de destino do Portal
+local portalUI = Instance.new("Frame")
+portalUI.BackgroundTransparency = 1
+portalUI.Size = UDim2.new(1, 0, 1, 0)
+portalUI.Visible = false
+portalUI.Parent = screenGui
+
+local title = Instance.new("TextLabel")
+title.AnchorPoint = Vector2.new(0.5, 0)
+title.Position = UDim2.new(0.5, 0, 0.05, 0)
+title.Size = UDim2.new(0.8, 0, 0, 40)
+title.BackgroundTransparency = 1
+title.Text = "🌀 ESCOLHA O DESTINO"
+title.TextColor3 = THEME.Accent2
+title.Font = Enum.Font.GothamBold
+title.TextScaled = true
+title.Parent = portalUI
+
+local hint = Instance.new("TextLabel")
+hint.AnchorPoint = Vector2.new(0.5, 0)
+hint.Position = UDim2.new(0.5, 0, 0.105, 0)
+hint.Size = UDim2.new(0.8, 0, 0, 22)
+hint.BackgroundTransparency = 1
+hint.Text = isTouch and "Arraste para olhar • Joystick para mover" or "WASD para mover • Mouse para olhar • Espaço/Ctrl para subir/descer"
+hint.TextColor3 = THEME.Text
+hint.Font = Enum.Font.Gotham
+hint.TextScaled = true
+hint.Parent = portalUI
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.AnchorPoint = Vector2.new(0.5, 0)
+statusLabel.Position = UDim2.new(0.5, 0, 0.16, 0)
+statusLabel.Size = UDim2.new(0.6, 0, 0, 26)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextScaled = true
+statusLabel.Text = ""
+statusLabel.Parent = portalUI
+
+local function makeActionButton(text, color, position, anchor)
+	local b = Instance.new("TextButton")
+	b.AnchorPoint = anchor
+	b.Position = position
+	b.Size = UDim2.new(0, 150, 0, 46)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextScaled = true
+	b.Parent = portalUI
+	corner(b, 10)
+	return b
+end
+
+local confirmBtn = makeActionButton("✅ CONFIRMAR", Color3.fromRGB(40, 160, 90), UDim2.new(0.5, -8, 0.92, 0), Vector2.new(1, 1))
+local cancelBtn = makeActionButton("❌ CANCELAR", Color3.fromRGB(170, 50, 50), UDim2.new(0.5, 8, 0.92, 0), Vector2.new(0, 1))
+
+-- Controles de toque (joystick + subir/descer + arrastar para olhar)
+local joystickVector = Vector2.new(0, 0)
+local lookDeltaAccum = Vector2.new(0, 0)
+local upHeld, downHeld = false, false
+
+if isTouch then
+	local lookCapture = Instance.new("Frame")
+	lookCapture.BackgroundTransparency = 1
+	lookCapture.Size = UDim2.new(1, 0, 1, 0)
+	lookCapture.ZIndex = 1
+	lookCapture.Parent = portalUI
+
+	local lookInput = nil
+	lookCapture.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			lookInput = input
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == lookInput and input.UserInputType == Enum.UserInputType.Touch then
+			lookDeltaAccum += Vector2.new(input.Delta.X, input.Delta.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input == lookInput then
+			lookInput = nil
+		end
+	end)
+
+	local joyBg = Instance.new("Frame")
+	joyBg.AnchorPoint = Vector2.new(0, 1)
+	joyBg.Position = UDim2.new(0, 30, 1, -30)
+	joyBg.Size = UDim2.new(0, 120, 0, 120)
+	joyBg.BackgroundColor3 = THEME.Bg
+	joyBg.BackgroundTransparency = 0.35
+	joyBg.ZIndex = 5
+	joyBg.Parent = portalUI
+	corner(joyBg, 60)
+	stroke(joyBg, 1.5, THEME.Accent)
+
+	local joyThumb = Instance.new("Frame")
+	joyThumb.AnchorPoint = Vector2.new(0.5, 0.5)
+	joyThumb.Position = UDim2.new(0.5, 0, 0.5, 0)
+	joyThumb.Size = UDim2.new(0, 50, 0, 50)
+	joyThumb.BackgroundColor3 = THEME.Accent
+	joyThumb.ZIndex = 6
+	joyThumb.Parent = joyBg
+	corner(joyThumb, 25)
+
+	local joyInput = nil
+	local joyRadius = 45
+
+	joyBg.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			joyInput = input
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == joyInput and input.UserInputType == Enum.UserInputType.Touch then
+			local center = joyBg.AbsolutePosition + joyBg.AbsoluteSize / 2
+			local delta = Vector2.new(input.Position.X, input.Position.Y) - center
+			if delta.Magnitude > joyRadius then
+				delta = delta.Unit * joyRadius
+			end
+			joyThumb.Position = UDim2.new(0.5, delta.X, 0.5, delta.Y)
+			joystickVector = Vector2.new(delta.X / joyRadius, delta.Y / joyRadius)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input == joyInput then
+			joyInput = nil
+			joystickVector = Vector2.new(0, 0)
+			joyThumb.Position = UDim2.new(0.5, 0, 0.5, 0)
+		end
+	end)
+
+	local function makeHoldButton(text, position)
+		local b = Instance.new("TextButton")
+		b.AnchorPoint = Vector2.new(1, 1)
+		b.Position = position
+		b.Size = UDim2.new(0, 56, 0, 56)
+		b.BackgroundColor3 = THEME.Bg
+		b.BackgroundTransparency = 0.25
+		b.Text = text
+		b.TextColor3 = THEME.Text
+		b.Font = Enum.Font.GothamBold
+		b.TextScaled = true
+		b.ZIndex = 5
+		b.Parent = portalUI
+		corner(b, 28)
+		stroke(b, 1.5, THEME.Accent)
+		return b
+	end
+
+	local upBtn = makeHoldButton("▲", UDim2.new(1, -14, 1, -170))
+	local downBtn = makeHoldButton("▼", UDim2.new(1, -14, 1, -104))
+
+	upBtn.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			upHeld = true
+		end
+	end)
+	upBtn.InputEnded:Connect(function() upHeld = false end)
+	downBtn.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+			downHeld = true
+		end
+	end)
+	downBtn.InputEnded:Connect(function() downHeld = false end)
+end
+
+----------------------------------------------------------------
+-- 6) PORTAL: câmera de seleção + criação + travessia
+----------------------------------------------------------------
+local isSelectingPortal = false
+local flyConnection = nil
+local flyPosition, flyYaw, flyPitch = Vector3.new(), 0, 0
+local candidatePosition = nil
+local reticlePart = nil
+local mouseDeltaAccum = Vector2.new(0, 0)
+local originalCameraType = Enum.CameraType.Custom
+local activePortalOrigin, activePortalDestination = nil, nil
+local activePortalDetection = nil
+
+local function updateReticle(position, valid)
+	local color = valid and Color3.fromRGB(120, 230, 140) or Color3.fromRGB(255, 90, 90)
+	if not reticlePart then
+		reticlePart = Effects.CreateCircle(CFrame.new(position), 8, color, false, ASSET_IDS.MagicCircle)
+		Effects.RegisterSpin(reticlePart, 45)
+	else
+		reticlePart.CFrame = CFrame.new(position)
+		reticlePart.Color = color
+	end
+end
+
+local function hideReticle()
+	if reticlePart then
+		Effects.UnregisterSpin(reticlePart)
+		reticlePart:Destroy()
+		reticlePart = nil
+	end
+end
+
+local function closePortalVisuals()
+	if activePortalOrigin then
+		Effects.FadeOutAndDestroy(activePortalOrigin, 0.6)
+		activePortalOrigin = nil
+	end
+	if activePortalDestination then
+		Effects.FadeOutAndDestroy(activePortalDestination, 0.6)
+		activePortalDestination = nil
+	end
+	if activePortalDetection then
+		activePortalDetection:Destroy()
+		activePortalDetection = nil
+	end
+end
+
+local function exitFlyMode(restoreCamera)
+	if flyConnection then
+		flyConnection:Disconnect()
+		flyConnection = nil
+	end
+	isSelectingPortal = false
+	candidatePosition = nil
+	hideReticle()
+	portalUI.Visible = false
+	if restoreCamera then
+		camera.CameraType = originalCameraType
+	end
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	UserInputService.MouseIconEnabled = true
+end
+
+local function updateFlyCamera(dt)
+	if not rootPart then
+		return
+	end
+
+	local lookDelta = mouseDeltaAccum
+	mouseDeltaAccum = Vector2.new(0, 0)
+	if isTouch then
+		lookDelta += lookDeltaAccum
+		lookDeltaAccum = Vector2.new(0, 0)
+	end
+
+	local sensitivity = PORTAL_CFG.FlyCamLookSensitivity
+	flyYaw = flyYaw - (lookDelta.X * sensitivity * 0.1)
+	flyPitch = math.clamp(flyPitch - (lookDelta.Y * sensitivity * 0.1), -80, 80)
+
+	local rotation = CFrame.Angles(0, math.rad(flyYaw), 0) * CFrame.Angles(math.rad(flyPitch), 0, 0)
+
+	local moveVector = Vector3.new(0, 0, 0)
+	if isTouch then
+		moveVector += Vector3.new(joystickVector.X, 0, joystickVector.Y)
+	end
+	if isKeyboard then
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveVector += Vector3.new(0, 0, -1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveVector += Vector3.new(0, 0, 1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveVector += Vector3.new(-1, 0, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveVector += Vector3.new(1, 0, 0) end
+	end
+	if moveVector.Magnitude > 1 then
+		moveVector = moveVector.Unit
+	end
+
+	local speed = PORTAL_CFG.FlyCamSpeed
+	if isKeyboard and UserInputService:IsKeyDown(FLYCAM_KEYS.Boost) then
+		speed = PORTAL_CFG.FlyCamBoostSpeed
+	end
+
+	local vertical = 0
+	if upHeld or (isKeyboard and UserInputService:IsKeyDown(FLYCAM_KEYS.Up)) then
+		vertical += 1
+	end
+	if downHeld or (isKeyboard and UserInputService:IsKeyDown(FLYCAM_KEYS.Down)) then
+		vertical -= 1
+	end
+
+	local worldMove = rotation:VectorToWorldSpace(moveVector) * speed * dt
+	worldMove += Vector3.new(0, vertical * PORTAL_CFG.FlyCamVerticalSpeed * dt, 0)
+	flyPosition += worldMove
+
+	camera.CFrame = CFrame.new(flyPosition) * rotation
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+
+	local result = workspace:Raycast(flyPosition, Vector3.new(0, -2000, 0), params)
+	if result then
+		local distance = (result.Position - rootPart.Position).Magnitude
+		local valid = distance <= PORTAL_CFG.MaxDistance and result.Normal.Y >= PORTAL_CFG.MinWalkableNormalY
+		candidatePosition = valid and result.Position or nil
+		updateReticle(result.Position, valid)
+		if valid then
+			statusLabel.Text = string.format("✅ Destino válido (%.0f studs)", distance)
+			statusLabel.TextColor3 = Color3.fromRGB(120, 230, 140)
+		elseif distance > PORTAL_CFG.MaxDistance then
+			statusLabel.Text = "❌ Muito longe"
+			statusLabel.TextColor3 = THEME.Danger
+		else
+			statusLabel.Text = "❌ Superfície inválida"
+			statusLabel.TextColor3 = THEME.Danger
+		end
+	else
+		candidatePosition = nil
+		hideReticle()
+		statusLabel.Text = "❌ Nenhum chão encontrado"
+		statusLabel.TextColor3 = THEME.Danger
+	end
+end
+
+local function onPortalTouched(hit)
+	if not activePortalDetection or not activePortalOrigin then
+		return
+	end
+	if not character or not hit:IsDescendantOf(character) then
+		return
+	end
+
+	local originCFrame = activePortalOrigin.CFrame
+	local destinationHit = activePortalDetection:GetAttribute("DestX") and Vector3.new(
+		activePortalDetection:GetAttribute("DestX"),
+		activePortalDetection:GetAttribute("DestY"),
+		activePortalDetection:GetAttribute("DestZ")
+	) or rootPart.Position
+
+	activePortalDetection:Destroy()
+	activePortalDetection = nil
+
+	local hipHeight = humanoid.HipHeight or 2
+	local exitPosition = destinationHit + Vector3.new(0, hipHeight + rootPart.Size.Y / 2 + 0.2, 0)
+		+ originCFrame.LookVector * PORTAL_CFG.OriginOffset * 0.5
+	local destinationCFrame = CFrame.lookAt(exitPosition, exitPosition + originCFrame.LookVector)
+
+	character:PivotTo(destinationCFrame)
+
+	if activePortalOrigin then
+		Effects.FadeOutAndDestroy(activePortalOrigin, 0.4)
+		activePortalOrigin = nil
+	end
+
+	local part = Effects.CreateCircle(destinationCFrame, PORTAL_CFG.PortalHeight, Color3.fromRGB(255, 180, 60), true, ASSET_IDS.Portal)
+	Effects.RegisterSpin(part, 25)
+	Effects.FadeIn(part, 0.4, 0.2)
+	activePortalDestination = part
+	Effects.CreateImpactBurst(destinationCFrame.Position, Color3.fromRGB(255, 180, 60), ASSET_IDS.MagicCircle)
+
+	task.delay(PORTAL_CFG.ExitVisualLifetime, function()
+		if activePortalDestination == part then
+			Effects.FadeOutAndDestroy(part, 0.6)
+			activePortalDestination = nil
+		end
+	end)
+end
+
+local function confirmPortal()
+	if not candidatePosition then
+		showMessage("Escolha um destino válido primeiro", 2)
+		return
+	end
+
+	-- validação local (sem servidor): distância, chão e obstrução
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+
+	local rayOrigin = candidatePosition + Vector3.new(0, PORTAL_CFG.GroundCheckTolerance, 0)
+	local result = workspace:Raycast(rayOrigin, Vector3.new(0, -(PORTAL_CFG.GroundCheckTolerance * 2), 0), params)
+	if not result then
+		showMessage("❌ Local inválido", 2)
+		return
+	end
+
+	local overlapParams = OverlapParams.new()
+	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+	overlapParams.FilterDescendantsInstances = { character, result.Instance }
+	local checkCenter = result.Position + Vector3.new(0, PORTAL_CFG.ObstructionCheckSize.Y / 2 + 0.5, 0)
+	local overlapping = workspace:GetPartBoundsInBox(CFrame.new(checkCenter), PORTAL_CFG.ObstructionCheckSize, overlapParams)
+	for _, part in ipairs(overlapping) do
+		if part.CanCollide then
+			showMessage("🚫 Local obstruído", 2)
+			return
+		end
+	end
+
+	setCooldown("Portal", ABILITY_CFG.Portal.Cooldown)
+	exitFlyMode(true)
+
+	local facing = rootPart.CFrame.LookVector
+	local originPos = rootPart.Position + facing * PORTAL_CFG.OriginOffset + Vector3.new(0, PORTAL_CFG.OriginHeight - rootPart.Size.Y / 2, 0)
+	local originCFrame = CFrame.lookAt(originPos, originPos + facing)
+
+	local part = Effects.CreateCircle(originCFrame, PORTAL_CFG.PortalHeight, Color3.fromRGB(255, 140, 40), true, ASSET_IDS.Portal)
+	Effects.RegisterSpin(part, 25)
+	Effects.FadeIn(part, 0.5, 0.2)
+	activePortalOrigin = part
+
+	local detectionPart = Instance.new("Part")
+	detectionPart.Name = "PortalDetection"
+	detectionPart.Size = PORTAL_CFG.EntryDetectionSize
+	detectionPart.CFrame = originCFrame
+	detectionPart.Anchored = true
+	detectionPart.CanCollide = false
+	detectionPart.CanTouch = true
+	detectionPart.CanQuery = false
+	detectionPart.Transparency = 1
+	detectionPart:SetAttribute("DestX", result.Position.X)
+	detectionPart:SetAttribute("DestY", result.Position.Y)
+	detectionPart:SetAttribute("DestZ", result.Position.Z)
+	detectionPart.Parent = workspace
+	activePortalDetection = detectionPart
+
+	local connection
+	connection = detectionPart.Touched:Connect(function(hit)
+		onPortalTouched(hit)
+	end)
+
+	task.delay(PORTAL_CFG.PortalLifetime, function()
+		if connection then
+			connection:Disconnect()
+		end
+		if activePortalDetection == detectionPart then
+			detectionPart:Destroy()
+			activePortalDetection = nil
+			closePortalVisuals()
+		end
+	end)
+end
+
+local function cancelPortal()
+	exitFlyMode(true)
+end
+
+confirmBtn.Activated:Connect(confirmPortal)
+cancelBtn.Activated:Connect(cancelPortal)
+
+local function startPortalSelection()
+	if isSelectingPortal or not rootPart or humanoid.Health <= 0 then
+		return
+	end
+	isSelectingPortal = true
+
+	originalCameraType = camera.CameraType
+	flyPosition = camera.CFrame.Position
+	local rx, ry = camera.CFrame:ToOrientation()
+	flyPitch = math.deg(rx)
+	flyYaw = math.deg(ry)
+
+	camera.CameraType = Enum.CameraType.Scriptable
+	portalUI.Visible = true
+	joystickVector = Vector2.new(0, 0)
+	lookDeltaAccum = Vector2.new(0, 0)
+
+	if isKeyboard then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		UserInputService.MouseIconEnabled = false
+	end
+
+	flyConnection = RunService.RenderStepped:Connect(updateFlyCamera)
+end
+
+----------------------------------------------------------------
+-- 7) MIRA (Rajada / Chicote)
+----------------------------------------------------------------
+local function getAimTargetPosition(range)
+	local origin = camera.CFrame.Position
+	local direction = camera.CFrame.LookVector * range
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+	local result = workspace:Raycast(origin, direction, params)
+	if result then
+		return result.Position
+	end
+	return origin + direction
+end
+
+local function getPlayersInRadius(position, radius)
+	local results = {}
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		if otherPlayer ~= player and otherPlayer.Character then
+			local otherHumanoid = otherPlayer.Character:FindFirstChildOfClass("Humanoid")
+			local otherRoot = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if otherHumanoid and otherRoot and otherHumanoid.Health > 0 then
+				if (otherRoot.Position - position).Magnitude <= radius then
+					table.insert(results, { Humanoid = otherHumanoid, RootPart = otherRoot })
+				end
+			end
+		end
+	end
+	return results
+end
+
+----------------------------------------------------------------
+-- 8) HABILIDADES
+----------------------------------------------------------------
+local shieldActive = false
+local isAstral = false
+local magicHandsActive = false
+local activeHandCircles = nil
+local activeAstralClone = nil
+
+local function playShield()
+	local cfg = ABILITY_CFG.Shield
+	shieldActive = true
+
+	local root = rootPart
+	local part = Effects.CreateCircle(root.CFrame * CFrame.new(0, 0, -3), 6, Color3.fromRGB(120, 200, 255), true, ASSET_IDS.Shield)
+	Effects.WeldTo(part, root, CFrame.new(0, 0, -3))
+	Effects.RegisterSpin(part, 20)
+	Effects.FadeIn(part, 0.3, 0.35)
+
+	task.delay(cfg.Duration, function()
+		shieldActive = false
+		Effects.FadeOutAndDestroy(part, 0.4)
+	end)
+end
+
+local function playMagicHands()
+	magicHandsActive = not magicHandsActive
+
+	if not magicHandsActive then
+		if activeHandCircles then
+			if activeHandCircles.Left then Effects.FadeOutAndDestroy(activeHandCircles.Left, 0.25) end
+			if activeHandCircles.Right then Effects.FadeOutAndDestroy(activeHandCircles.Right, 0.25) end
+			activeHandCircles = nil
+		end
+		return
+	end
+
+	local leftHand = Effects.GetHand(character, false)
+	local rightHand = Effects.GetHand(character, true)
+	local entry = {}
+
+	if leftHand then
+		local circle = Effects.CreateCircle(leftHand.CFrame, 1.6, Color3.fromRGB(255, 170, 60), false, ASSET_IDS.MagicCircle)
+		Effects.WeldTo(circle, leftHand, CFrame.new(0, -0.6, 0))
+		Effects.RegisterSpin(circle, 90)
+		Effects.FadeIn(circle, 0.2, 0.15)
+		entry.Left = circle
+	end
+	if rightHand then
+		local circle = Effects.CreateCircle(rightHand.CFrame, 1.6, Color3.fromRGB(255, 170, 60), false, ASSET_IDS.MagicCircle)
+		Effects.WeldTo(circle, rightHand, CFrame.new(0, -0.6, 0))
+		Effects.RegisterSpin(circle, -90)
+		Effects.FadeIn(circle, 0.2, 0.15)
+		entry.Right = circle
+	end
+
+	activeHandCircles = entry
+end
+
+local function playBlast()
+	local cfg = ABILITY_CFG.Blast
+	local aimPoint = getAimTargetPosition(cfg.Range)
+	local direction = (aimPoint - rootPart.Position)
+	if direction.Magnitude <= 0.01 then
+		direction = rootPart.CFrame.LookVector
+	end
+	direction = direction.Unit
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+
+	local origin = rootPart.Position + Vector3.new(0, 1, 0)
+	local result = workspace:Raycast(origin, direction * cfg.Range, params)
+	local hitPosition = origin + direction * cfg.Range
+
+	if result then
+		hitPosition = result.Position
+		local hitCharacter = result.Instance:FindFirstAncestorOfClass("Model")
+		local targetPlayer = hitCharacter and Players:GetPlayerFromCharacter(hitCharacter)
+		if targetPlayer and targetPlayer ~= player then
+			local targetHumanoid = hitCharacter:FindFirstChildOfClass("Humanoid")
+			local targetRoot = hitCharacter:FindFirstChild("HumanoidRootPart")
+			if targetHumanoid and targetRoot and targetHumanoid.Health > 0 then
+				targetHumanoid:TakeDamage(cfg.Damage) -- best-effort (ver aviso no topo do arquivo)
+				targetRoot.AssemblyLinearVelocity = targetRoot.AssemblyLinearVelocity
+					+ Vector3.new(direction.X, 0.18, direction.Z) * cfg.KnockbackForce
+			end
+		end
+	end
+
+	Effects.CreateImpactBolt(origin, hitPosition, Color3.fromRGB(255, 150, 40), function()
+		Effects.CreateImpactBurst(hitPosition, Color3.fromRGB(255, 150, 40), ASSET_IDS.MagicCircle)
+	end)
+end
+
+local function playWhip()
+	local cfg = ABILITY_CFG.Whip
+	local strikePoint = rootPart.Position + rootPart.CFrame.LookVector * cfg.Range
+	local targets = getPlayersInRadius(strikePoint, cfg.Radius)
+
+	for _, target in ipairs(targets) do
+		local direction = Vector3.new(target.RootPart.Position.X - rootPart.Position.X, 0, target.RootPart.Position.Z - rootPart.Position.Z)
+		if direction.Magnitude > 0 then
+			direction = direction.Unit
+		else
+			direction = rootPart.CFrame.LookVector
+		end
+		target.Humanoid:TakeDamage(cfg.Damage) -- best-effort (ver aviso no topo do arquivo)
+		target.RootPart.AssemblyLinearVelocity = target.RootPart.AssemblyLinearVelocity
+			+ Vector3.new(direction.X, 0.18, direction.Z) * cfg.KnockbackForce
+		Effects.CreateImpactBurst(target.RootPart.Position, Color3.fromRGB(255, 90, 30), ASSET_IDS.MagicCircle)
+	end
+end
+
+local function playAstral()
+	local cfg = ABILITY_CFG.Astral
+	isAstral = true
+	humanoid.WalkSpeed = 0
+	humanoid.JumpPower = 0
+
+	local originCFrame = rootPart.CFrame
+	local clone = character:Clone()
+	for _, inst in ipairs(clone:GetDescendants()) do
+		if inst:IsA("Script") or inst:IsA("LocalScript") then
+			inst:Destroy()
+		elseif inst:IsA("BasePart") then
+			inst.CanCollide = false
+			inst.CanTouch = false
+			inst.CanQuery = false
+			inst.Transparency = 0.55
+		end
+	end
+	local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
+	if cloneHumanoid then
+		cloneHumanoid.WalkSpeed = 0
+		cloneHumanoid.JumpPower = 0
+		cloneHumanoid.DisplayName = ""
+	end
+	clone.Name = "AstralProjection"
+	clone:PivotTo(originCFrame + (originCFrame.LookVector * 2))
+	clone.Parent = workspace
+	activeAstralClone = clone
+
+	local cloneRoot = clone.PrimaryPart or clone:FindFirstChild("HumanoidRootPart")
+	if cloneRoot then
+		pcall(function()
+			TweenService:Create(cloneRoot, TweenInfo.new(cfg.Duration, Enum.EasingStyle.Sine), {
+				CFrame = originCFrame * CFrame.new(0, 0, -6),
+			}):Play()
+		end)
+	end
+
+	task.delay(cfg.Duration, function()
+		isAstral = false
+		if humanoid.Parent and humanoid.Health > 0 then
+			humanoid.WalkSpeed = savedWalkSpeed
+			humanoid.JumpPower = savedJumpPower
+		end
+		if activeAstralClone == clone then
+			clone:Destroy()
+			activeAstralClone = nil
+		end
+	end)
+end
+
+local function playIllusion()
+	local cfg = ABILITY_CFG.Illusion
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+
+	local clones = {}
+	for i = 1, cfg.CloneCount do
+		local angle = (i / cfg.CloneCount) * math.pi * 2 + math.random() * 0.5
+		local dist = cfg.SpawnRadius * (0.6 + math.random() * 0.4)
+		local flatOffset = Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+		local castOrigin = rootPart.Position + flatOffset + Vector3.new(0, 10, 0)
+		local result = workspace:Raycast(castOrigin, Vector3.new(0, -30, 0), params)
+
+		if result then
+			local clone = character:Clone()
+			for _, inst in ipairs(clone:GetDescendants()) do
+				if inst:IsA("Script") or inst:IsA("LocalScript") then
+					inst:Destroy()
+				elseif inst:IsA("BasePart") then
+					inst.CanCollide = false
+					inst.CanTouch = false
+					inst.CanQuery = false
+					inst.Transparency = 0.35
+				end
+			end
+			local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
+			if cloneHumanoid then
+				cloneHumanoid.WalkSpeed = 0
+				cloneHumanoid.JumpPower = 0
+				cloneHumanoid.DisplayName = ""
+			end
+			clone.Name = "IllusionClone"
+			local root = clone:FindFirstChild("HumanoidRootPart")
+			if root then
+				clone:PivotTo(CFrame.new(result.Position) * (root.CFrame - root.CFrame.Position))
+			end
+			clone.Parent = workspace
+			table.insert(clones, clone)
+		end
+	end
+
+	task.delay(cfg.Duration, function()
+		for _, clone in ipairs(clones) do
+			if clone.Parent then
+				clone:Destroy()
+			end
+		end
+	end)
+end
+
+local function playUltimate()
+	local cfg = ABILITY_CFG.Ultimate
+	local castPosition = rootPart.Position
+	local base = CFrame.new(castPosition)
+
+	for i = 1, 3 do
+		local diameter = cfg.Radius * (0.4 + i * 0.25)
+		local circle = Effects.CreateCircle(base * CFrame.new(0, 0.1 * i, 0), diameter, Color3.fromRGB(255, 150, 40), false, ASSET_IDS.MagicCircle)
+		Effects.RegisterSpin(circle, i % 2 == 0 and 20 or -20)
+		Effects.FadeIn(circle, cfg.PrepTime, 0.35)
+		task.delay(cfg.PrepTime + 1.2, function()
+			Effects.FadeOutAndDestroy(circle, 0.6)
+		end)
+	end
+
+	task.delay(cfg.PrepTime, function()
+		local targets = getPlayersInRadius(castPosition, cfg.Radius)
+		for _, target in ipairs(targets) do
+			target.Humanoid:TakeDamage(cfg.Damage) -- best-effort (ver aviso no topo do arquivo)
+			local tWalk, tJump = target.Humanoid.WalkSpeed, target.Humanoid.JumpPower
+			target.Humanoid.WalkSpeed = 0
+			target.Humanoid.JumpPower = 0
+			task.delay(cfg.ImmobilizeTime, function()
+				if target.Humanoid.Parent and target.Humanoid.Health > 0 then
+					target.Humanoid.WalkSpeed = tWalk
+					target.Humanoid.JumpPower = tJump
+				end
+			end)
+		end
+		Effects.CreateImpactBurst(castPosition, Color3.fromRGB(255, 190, 90), ASSET_IDS.MagicCircle)
+	end)
+end
+
+-- Escudo local: tenta "curar de volta" parte do dano recebido enquanto
+-- ativo (aproximação client-side de redução de dano, já que não há
+-- servidor validando quem pode alterar o Health de quem).
+local function hookShieldReduction(char)
+	local hum = char:WaitForChild("Humanoid")
+	local lastHealth = hum.Health
+	hum.HealthChanged:Connect(function(newHealth)
+		if shieldActive and newHealth < lastHealth then
+			local blocked = (lastHealth - newHealth) * ABILITY_CFG.Shield.DamageReduction
+			hum.Health = math.min(hum.MaxHealth, newHealth + blocked)
+		end
+		lastHealth = hum.Health
+	end)
+end
+
+if character then
+	hookShieldReduction(character)
+end
+player.CharacterAdded:Connect(hookShieldReduction)
+
+----------------------------------------------------------------
+-- 9) DISPARO DE HABILIDADES + COOLDOWN + INPUT
+----------------------------------------------------------------
+local cooldownEnds = {}
+
+local function isOnCooldown(abilityName)
+	local endTime = cooldownEnds[abilityName]
+	return endTime ~= nil and endTime > os.clock()
+end
+
+local abilityFunctions = {
+	Shield = playShield,
+	MagicHands = playMagicHands,
+	Blast = playBlast,
+	Whip = playWhip,
+	Astral = playAstral,
+	Illusion = playIllusion,
+	Ultimate = playUltimate,
+}
+
+handleAbilityInput = function(abilityName)
+	if not character or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	if abilityName == "Portal" then
+		if isSelectingPortal then
+			return
+		end
+		if isOnCooldown("Portal") then
+			showMessage("⏳ Portal ainda em recarga", 2)
+			return
+		end
+		startPortalSelection()
+		return
+	end
+
+	if isSelectingPortal or isAstral then
+		return
+	end
+
+	if isOnCooldown(abilityName) then
+		showMessage("⏳ Em recarga", 1.2)
+		return
+	end
+
+	local cfg = ABILITY_CFG[abilityName]
+	cooldownEnds[abilityName] = os.clock() + cfg.Cooldown
+	setCooldown(abilityName, cfg.Cooldown)
+
+	local fn = abilityFunctions[abilityName]
+	if fn then
+		fn()
+	end
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+	for abilityName, keyCode in pairs(KEYBINDS) do
+		if input.KeyCode == keyCode then
+			handleAbilityInput(abilityName)
+			return
+		end
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if isSelectingPortal and input.UserInputType == Enum.UserInputType.MouseMovement then
+		mouseDeltaAccum += Vector2.new(input.Delta.X, input.Delta.Y)
+	end
+end)
+
+print("[DoctorStrangeLocalScript] Sistema do Doutor Estranho (versão em 1 LocalScript) pronto.")
