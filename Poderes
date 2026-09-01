@@ -166,13 +166,13 @@ function Effects.CreateCircle(cframe, diameter, color, vertical, textureId)
 	return part
 end
 
-function Effects.FadeIn(part, duration, targetTransparency)
-	local goal = targetTransparency or 0.15
-	TweenService:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
-		Transparency = goal,
-	}):Play()
+-- O Part em si NUNCA fica visível (Transparency sempre 1) — só o Decal
+-- é animado. É isso que evita o "quadrado" atrás da textura mágica.
+function Effects.FadeIn(part, duration, _unusedTargetTransparency)
+	part.Transparency = 1
 	for _, child in ipairs(part:GetChildren()) do
 		if child:IsA("Decal") then
+			child.Transparency = 1
 			TweenService:Create(child, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
 				Transparency = 0,
 			}):Play()
@@ -185,9 +185,6 @@ function Effects.FadeOutAndDestroy(part, duration)
 		return
 	end
 	Effects.UnregisterSpin(part)
-	TweenService:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
-		Transparency = 1,
-	}):Play()
 	for _, child in ipairs(part:GetChildren()) do
 		if child:IsA("Decal") then
 			TweenService:Create(child, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
@@ -273,8 +270,15 @@ function Effects.GetHand(character, isRight)
 	end
 end
 
+-- IMPORTANTE: o Part precisa estar Anchored = false para um
+-- WeldConstraint funcionar corretamente. Um Part Anchored soldado a um
+-- membro do personagem trava o "assembly" físico do rig e é a causa
+-- raiz do personagem girar/travar sozinho ao usar Magia das Mãos ou
+-- o Escudo. O CFrame do personagem em si NUNCA é tocado aqui.
 function Effects.WeldTo(part, limb, offsetCFrame)
 	part.CFrame = limb.CFrame * (offsetCFrame or CFrame.new())
+	part.Anchored = false
+	part.Massless = true
 	local weld = Instance.new("WeldConstraint")
 	weld.Part0 = part
 	weld.Part1 = limb
@@ -655,6 +659,37 @@ local originalCameraType = Enum.CameraType.Custom
 local activePortalOrigin, activePortalDestination = nil, nil
 local activePortalDetection = nil
 
+-- O portal é composto por dois objetos:
+--   Main -> o disco grande com a textura de Portal. Orientação
+--           calculada UMA VEZ na criação e nunca mais alterada
+--           (nem CFrame nem rotação) — fica travado no espaço.
+--   Ring -> um anel decorativo menor (textura Magic Circle) que pode
+--           girar livremente, sem afetar a estabilidade do Main.
+local function createPortalVisual(cframe, color)
+	local main = Effects.CreateCircle(cframe, PORTAL_CFG.PortalHeight, color, true, ASSET_IDS.Portal)
+	Effects.FadeIn(main, 0.4)
+	-- NUNCA chamar Effects.RegisterSpin no "main": ele precisa ficar
+	-- parado, olhando sempre na mesma direção em que foi criado.
+
+	local ring = Effects.CreateCircle(cframe, PORTAL_CFG.PortalHeight * 0.6, color, true, ASSET_IDS.MagicCircle)
+	Effects.FadeIn(ring, 0.4)
+	Effects.RegisterSpin(ring, 30) -- só o anel interno gira
+
+	return { Main = main, Ring = ring }
+end
+
+local function fadePortalVisual(visual, duration)
+	if not visual then
+		return
+	end
+	if visual.Main then
+		Effects.FadeOutAndDestroy(visual.Main, duration)
+	end
+	if visual.Ring then
+		Effects.FadeOutAndDestroy(visual.Ring, duration)
+	end
+end
+
 local function updateReticle(position, valid)
 	local color = valid and Color3.fromRGB(120, 230, 140) or Color3.fromRGB(255, 90, 90)
 	if not reticlePart then
@@ -676,11 +711,11 @@ end
 
 local function closePortalVisuals()
 	if activePortalOrigin then
-		Effects.FadeOutAndDestroy(activePortalOrigin, 0.6)
+		fadePortalVisual(activePortalOrigin, 0.6)
 		activePortalOrigin = nil
 	end
 	if activePortalDestination then
-		Effects.FadeOutAndDestroy(activePortalDestination, 0.6)
+		fadePortalVisual(activePortalDestination, 0.6)
 		activePortalDestination = nil
 	end
 	if activePortalDetection then
@@ -792,7 +827,7 @@ local function onPortalTouched(hit)
 		return
 	end
 
-	local originCFrame = activePortalOrigin.CFrame
+	local originCFrame = activePortalOrigin.Main.CFrame
 	local destinationHit = activePortalDetection:GetAttribute("DestX") and Vector3.new(
 		activePortalDetection:GetAttribute("DestX"),
 		activePortalDetection:GetAttribute("DestY"),
@@ -810,19 +845,17 @@ local function onPortalTouched(hit)
 	character:PivotTo(destinationCFrame)
 
 	if activePortalOrigin then
-		Effects.FadeOutAndDestroy(activePortalOrigin, 0.4)
+		fadePortalVisual(activePortalOrigin, 0.4)
 		activePortalOrigin = nil
 	end
 
-	local part = Effects.CreateCircle(destinationCFrame, PORTAL_CFG.PortalHeight, Color3.fromRGB(255, 180, 60), true, ASSET_IDS.Portal)
-	Effects.RegisterSpin(part, 25)
-	Effects.FadeIn(part, 0.4, 0.2)
-	activePortalDestination = part
+	local visual = createPortalVisual(destinationCFrame, Color3.fromRGB(255, 180, 60))
+	activePortalDestination = visual
 	Effects.CreateImpactBurst(destinationCFrame.Position, Color3.fromRGB(255, 180, 60), ASSET_IDS.MagicCircle)
 
 	task.delay(PORTAL_CFG.ExitVisualLifetime, function()
-		if activePortalDestination == part then
-			Effects.FadeOutAndDestroy(part, 0.6)
+		if activePortalDestination == visual then
+			fadePortalVisual(visual, 0.6)
 			activePortalDestination = nil
 		end
 	end)
@@ -865,9 +898,7 @@ local function confirmPortal()
 	local originPos = rootPart.Position + facing * PORTAL_CFG.OriginOffset + Vector3.new(0, PORTAL_CFG.OriginHeight - rootPart.Size.Y / 2, 0)
 	local originCFrame = CFrame.lookAt(originPos, originPos + facing)
 
-	local part = Effects.CreateCircle(originCFrame, PORTAL_CFG.PortalHeight, Color3.fromRGB(255, 140, 40), true, ASSET_IDS.Portal)
-	Effects.RegisterSpin(part, 25)
-	Effects.FadeIn(part, 0.5, 0.2)
+	local part = createPortalVisual(originCFrame, Color3.fromRGB(255, 140, 40))
 	activePortalOrigin = part
 
 	local detectionPart = Instance.new("Part")
