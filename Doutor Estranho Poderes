@@ -75,9 +75,9 @@ local ABILITY_DISPLAY = {
 }
 
 local PORTAL_CFG = {
-	MaxDistance = 150,
-	FlyCamSpeed = 60,
-	FlyCamBoostSpeed = 140,
+	MaxDistance = 2000, -- distância máxima do destino (aumente livremente para mapas ainda maiores)
+	FlyCamSpeed = 140,
+	FlyCamBoostSpeed = 420,
 	FlyCamVerticalSpeed = 45,
 	FlyCamLookSensitivity = 0.35,
 	GroundCheckTolerance = 6,
@@ -110,13 +110,27 @@ local ABILITY_CFG = {
 ----------------------------------------------------------------
 local Effects = {}
 
-local spinning = {}
+local spinning = {} -- [part] = graus/seg (rotação própria, parte parada no mundo)
+local attached = {} -- [part] = { Limb, Offset, SpinSpeed, Angle } (acompanha um membro via script)
+
 RunService.Heartbeat:Connect(function(dt)
 	for part, speed in pairs(spinning) do
 		if part.Parent then
 			part.CFrame = part.CFrame * CFrame.Angles(0, math.rad(speed * dt), 0)
 		else
 			spinning[part] = nil
+		end
+	end
+	for part, info in pairs(attached) do
+		if part.Parent and info.Limb.Parent then
+			if info.SpinSpeed ~= 0 then
+				info.Angle = (info.Angle + info.SpinSpeed * dt) % 360
+				part.CFrame = info.Limb.CFrame * info.Offset * CFrame.Angles(0, math.rad(info.Angle), 0)
+			else
+				part.CFrame = info.Limb.CFrame * info.Offset
+			end
+		else
+			attached[part] = nil
 		end
 	end
 end)
@@ -185,6 +199,7 @@ function Effects.FadeOutAndDestroy(part, duration)
 		return
 	end
 	Effects.UnregisterSpin(part)
+	Effects.Detach(part)
 	for _, child in ipairs(part:GetChildren()) do
 		if child:IsA("Decal") then
 			TweenService:Create(child, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {
@@ -270,20 +285,21 @@ function Effects.GetHand(character, isRight)
 	end
 end
 
--- IMPORTANTE: o Part precisa estar Anchored = false para um
--- WeldConstraint funcionar corretamente. Um Part Anchored soldado a um
--- membro do personagem trava o "assembly" físico do rig e é a causa
--- raiz do personagem girar/travar sozinho ao usar Magia das Mãos ou
--- o Escudo. O CFrame do personagem em si NUNCA é tocado aqui.
-function Effects.WeldTo(part, limb, offsetCFrame)
-	part.CFrame = limb.CFrame * (offsetCFrame or CFrame.new())
-	part.Anchored = false
-	part.Massless = true
-	local weld = Instance.new("WeldConstraint")
-	weld.Part0 = part
-	weld.Part1 = limb
-	weld.Parent = part
-	return weld
+-- Substitui a solda física (WeldConstraint) por acompanhamento via
+-- script: o Part fica Anchored = true (não participa da física) e o
+-- loop de Heartbeat acima só COPIA o CFrame do membro + um offset.
+-- Isso torna IMPOSSÍVEL esse efeito mover, girar ou empurrar o
+-- personagem — é uma via de mão única (membro -> efeito, nunca o
+-- contrário). spinDegPerSec é opcional (0 = só acompanha, sem girar).
+function Effects.AttachTo(part, limb, offsetCFrame, spinDegPerSec)
+	part.Anchored = true
+	local offset = offsetCFrame or CFrame.new()
+	attached[part] = { Limb = limb, Offset = offset, SpinSpeed = spinDegPerSec or 0, Angle = 0 }
+	part.CFrame = limb.CFrame * offset
+end
+
+function Effects.Detach(part)
+	attached[part] = nil
 end
 
 ----------------------------------------------------------------
@@ -291,7 +307,58 @@ end
 ----------------------------------------------------------------
 local character = player.Character
 local humanoid, rootPart
-local savedWalkSpeed, savedJumpPower = 16, 50
+local savedWalkSpeed, savedJumpPower, savedJumpHeight = 16, 50, 7.2
+
+-- Controle oficial de movimento do jogador (PlayerModule). Usado para
+-- BLOQUEAR de verdade andar/correr/pular/virar durante a seleção do
+-- Portal e as habilidades que "param" o personagem — sem isso, os
+-- controles padrão do Roblox continuam lendo WASD ao mesmo tempo que
+-- o nosso script, e é isso que fazia o personagem andar/girar sozinho.
+local playerControls = nil
+do
+	local ok, result = pcall(function()
+		local playerScripts = player:WaitForChild("PlayerScripts", 10)
+		local playerModule = require(playerScripts:WaitForChild("PlayerModule", 10))
+		return playerModule:GetControls()
+	end)
+	if ok then
+		playerControls = result
+	end
+end
+
+local freezeDepth = 0
+
+local function freezeCharacter()
+	freezeDepth += 1
+	if freezeDepth > 1 then
+		return
+	end
+	if playerControls then
+		pcall(function() playerControls:Disable() end)
+	end
+	if humanoid then
+		humanoid.WalkSpeed = 0
+		humanoid.JumpPower = 0
+		humanoid.JumpHeight = 0
+		humanoid.AutoRotate = false
+	end
+end
+
+local function unfreezeCharacter()
+	freezeDepth = math.max(0, freezeDepth - 1)
+	if freezeDepth > 0 then
+		return
+	end
+	if playerControls then
+		pcall(function() playerControls:Enable() end)
+	end
+	if humanoid and humanoid.Parent then
+		humanoid.WalkSpeed = savedWalkSpeed
+		humanoid.JumpPower = savedJumpPower
+		humanoid.JumpHeight = savedJumpHeight
+		humanoid.AutoRotate = true
+	end
+end
 
 local function bindCharacter(char)
 	character = char
@@ -299,6 +366,13 @@ local function bindCharacter(char)
 	rootPart = char:WaitForChild("HumanoidRootPart")
 	savedWalkSpeed = humanoid.WalkSpeed
 	savedJumpPower = humanoid.JumpPower
+	savedJumpHeight = humanoid.JumpHeight
+	-- personagem novo (respawn): garante que nada fique travado de uma
+	-- vida anterior
+	freezeDepth = 0
+	if playerControls then
+		pcall(function() playerControls:Enable() end)
+	end
 end
 
 if character then
@@ -654,26 +728,34 @@ local flyConnection = nil
 local flyPosition, flyYaw, flyPitch = Vector3.new(), 0, 0
 local candidatePosition = nil
 local reticlePart = nil
+local reticleBeam = nil
 local mouseDeltaAccum = Vector2.new(0, 0)
 local originalCameraType = Enum.CameraType.Custom
 local activePortalOrigin, activePortalDestination = nil, nil
 local activePortalDetection = nil
 
--- O portal é composto por dois objetos:
+-- O portal é composto por dois objetos, e NENHUM DOS DOIS gira:
 --   Main -> o disco grande com a textura de Portal. Orientação
---           calculada UMA VEZ na criação e nunca mais alterada
---           (nem CFrame nem rotação) — fica travado no espaço.
---   Ring -> um anel decorativo menor (textura Magic Circle) que pode
---           girar livremente, sem afetar a estabilidade do Main.
+--           calculada UMA VEZ na criação e nunca mais alterada.
+--   Ring -> um anel decorativo menor (textura Magic Circle). Não gira;
+--           só pulsa (brilha/esmaece) bem devagar, um detalhe pequeno
+--           e sutil, exatamente como pedido.
 local function createPortalVisual(cframe, color)
 	local main = Effects.CreateCircle(cframe, PORTAL_CFG.PortalHeight, color, true, ASSET_IDS.Portal)
 	Effects.FadeIn(main, 0.4)
-	-- NUNCA chamar Effects.RegisterSpin no "main": ele precisa ficar
-	-- parado, olhando sempre na mesma direção em que foi criado.
+	-- NUNCA chamar Effects.RegisterSpin/AttachTo com spin no "main":
+	-- ele precisa ficar 100% parado, sempre olhando na mesma direção.
 
-	local ring = Effects.CreateCircle(cframe, PORTAL_CFG.PortalHeight * 0.6, color, true, ASSET_IDS.MagicCircle)
+	local ring = Effects.CreateCircle(cframe, PORTAL_CFG.PortalHeight * 0.45, color, true, ASSET_IDS.MagicCircle)
 	Effects.FadeIn(ring, 0.4)
-	Effects.RegisterSpin(ring, 30) -- só o anel interno gira
+	-- pulso sutil de brilho — SEM nenhuma rotação
+	for _, decal in ipairs(ring:GetChildren()) do
+		if decal:IsA("Decal") then
+			TweenService:Create(decal, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+				Transparency = 0.5,
+			}):Play()
+		end
+	end
 
 	return { Main = main, Ring = ring }
 end
@@ -699,6 +781,20 @@ local function updateReticle(position, valid)
 		reticlePart.CFrame = CFrame.new(position)
 		reticlePart.Color = color
 	end
+
+	if not reticleBeam then
+		reticleBeam = Instance.new("Part")
+		reticleBeam.Anchored = true
+		reticleBeam.CanCollide = false
+		reticleBeam.CanTouch = false
+		reticleBeam.CanQuery = false
+		reticleBeam.Material = Enum.Material.Neon
+		reticleBeam.Size = Vector3.new(0.4, 20, 0.4)
+		reticleBeam.Transparency = 0.35
+		reticleBeam.Parent = workspace
+	end
+	reticleBeam.Color = color
+	reticleBeam.CFrame = CFrame.new(position + Vector3.new(0, 10, 0))
 end
 
 local function hideReticle()
@@ -706,6 +802,10 @@ local function hideReticle()
 		Effects.UnregisterSpin(reticlePart)
 		reticlePart:Destroy()
 		reticlePart = nil
+	end
+	if reticleBeam then
+		reticleBeam:Destroy()
+		reticleBeam = nil
 	end
 end
 
@@ -728,6 +828,9 @@ local function exitFlyMode(restoreCamera)
 	if flyConnection then
 		flyConnection:Disconnect()
 		flyConnection = nil
+	end
+	if isSelectingPortal then
+		unfreezeCharacter()
 	end
 	isSelectingPortal = false
 	candidatePosition = nil
@@ -945,6 +1048,7 @@ local function startPortalSelection()
 		return
 	end
 	isSelectingPortal = true
+	freezeCharacter()
 
 	originalCameraType = camera.CameraType
 	flyPosition = camera.CFrame.Position
@@ -1001,10 +1105,8 @@ end
 -- 8) HABILIDADES
 ----------------------------------------------------------------
 local shieldActive = false
-local isAstral = false
 local magicHandsActive = false
 local activeHandCircles = nil
-local activeAstralClone = nil
 
 local function playShield()
 	local cfg = ABILITY_CFG.Shield
@@ -1012,9 +1114,8 @@ local function playShield()
 
 	local root = rootPart
 	local part = Effects.CreateCircle(root.CFrame * CFrame.new(0, 0, -3), 6, Color3.fromRGB(120, 200, 255), true, ASSET_IDS.Shield)
-	Effects.WeldTo(part, root, CFrame.new(0, 0, -3))
-	Effects.RegisterSpin(part, 20)
-	Effects.FadeIn(part, 0.3, 0.35)
+	Effects.AttachTo(part, root, CFrame.new(0, 0, -3), 20)
+	Effects.FadeIn(part, 0.3)
 
 	task.delay(cfg.Duration, function()
 		shieldActive = false
@@ -1040,16 +1141,14 @@ local function playMagicHands()
 
 	if leftHand then
 		local circle = Effects.CreateCircle(leftHand.CFrame, 1.6, Color3.fromRGB(255, 170, 60), false, ASSET_IDS.MagicCircle)
-		Effects.WeldTo(circle, leftHand, CFrame.new(0, -0.6, 0))
-		Effects.RegisterSpin(circle, 90)
-		Effects.FadeIn(circle, 0.2, 0.15)
+		Effects.AttachTo(circle, leftHand, CFrame.new(0, -0.6, 0), 90)
+		Effects.FadeIn(circle, 0.2)
 		entry.Left = circle
 	end
 	if rightHand then
 		local circle = Effects.CreateCircle(rightHand.CFrame, 1.6, Color3.fromRGB(255, 170, 60), false, ASSET_IDS.MagicCircle)
-		Effects.WeldTo(circle, rightHand, CFrame.new(0, -0.6, 0))
-		Effects.RegisterSpin(circle, -90)
-		Effects.FadeIn(circle, 0.2, 0.15)
+		Effects.AttachTo(circle, rightHand, CFrame.new(0, -0.6, 0), -90)
+		Effects.FadeIn(circle, 0.2)
 		entry.Right = circle
 	end
 
@@ -1093,125 +1192,41 @@ local function playBlast()
 	end)
 end
 
-local function playWhip()
-	local cfg = ABILITY_CFG.Whip
-	local strikePoint = rootPart.Position + rootPart.CFrame.LookVector * cfg.Range
-	local targets = getPlayersInRadius(strikePoint, cfg.Radius)
+-- Chicote, Astral e Ilusão estão temporariamente DESATIVADOS (a
+-- pedido): por enquanto só congelam o personagem (mesmo sistema do
+-- Portal) com um efeito visual pequeno. Cooldown e botão continuam
+-- normalmente. Nenhum causa dano, cria clone ou move o personagem.
+local FROZEN_PLACEHOLDER_DURATION = {
+	Whip = 1.2,
+	Astral = 3,
+	Illusion = 1.2,
+}
+local FROZEN_PLACEHOLDER_COLOR = {
+	Whip = Color3.fromRGB(255, 120, 60),
+	Astral = Color3.fromRGB(180, 160, 255),
+	Illusion = Color3.fromRGB(200, 160, 255),
+}
 
-	for _, target in ipairs(targets) do
-		local direction = Vector3.new(target.RootPart.Position.X - rootPart.Position.X, 0, target.RootPart.Position.Z - rootPart.Position.Z)
-		if direction.Magnitude > 0 then
-			direction = direction.Unit
-		else
-			direction = rootPart.CFrame.LookVector
-		end
-		target.Humanoid:TakeDamage(cfg.Damage) -- best-effort (ver aviso no topo do arquivo)
-		target.RootPart.AssemblyLinearVelocity = target.RootPart.AssemblyLinearVelocity
-			+ Vector3.new(direction.X, 0.18, direction.Z) * cfg.KnockbackForce
-		Effects.CreateImpactBurst(target.RootPart.Position, Color3.fromRGB(255, 90, 30), ASSET_IDS.MagicCircle)
+local function playFrozenPlaceholder(abilityName)
+	freezeCharacter()
+	if rootPart then
+		Effects.CreateImpactBurst(rootPart.Position, FROZEN_PLACEHOLDER_COLOR[abilityName], ASSET_IDS.MagicCircle)
 	end
+	task.delay(FROZEN_PLACEHOLDER_DURATION[abilityName], function()
+		unfreezeCharacter()
+	end)
+end
+
+local function playWhip()
+	playFrozenPlaceholder("Whip")
 end
 
 local function playAstral()
-	local cfg = ABILITY_CFG.Astral
-	isAstral = true
-	humanoid.WalkSpeed = 0
-	humanoid.JumpPower = 0
-
-	local originCFrame = rootPart.CFrame
-	local clone = character:Clone()
-	for _, inst in ipairs(clone:GetDescendants()) do
-		if inst:IsA("Script") or inst:IsA("LocalScript") then
-			inst:Destroy()
-		elseif inst:IsA("BasePart") then
-			inst.CanCollide = false
-			inst.CanTouch = false
-			inst.CanQuery = false
-			inst.Transparency = 0.55
-		end
-	end
-	local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
-	if cloneHumanoid then
-		cloneHumanoid.WalkSpeed = 0
-		cloneHumanoid.JumpPower = 0
-		cloneHumanoid.DisplayName = ""
-	end
-	clone.Name = "AstralProjection"
-	clone:PivotTo(originCFrame + (originCFrame.LookVector * 2))
-	clone.Parent = workspace
-	activeAstralClone = clone
-
-	local cloneRoot = clone.PrimaryPart or clone:FindFirstChild("HumanoidRootPart")
-	if cloneRoot then
-		pcall(function()
-			TweenService:Create(cloneRoot, TweenInfo.new(cfg.Duration, Enum.EasingStyle.Sine), {
-				CFrame = originCFrame * CFrame.new(0, 0, -6),
-			}):Play()
-		end)
-	end
-
-	task.delay(cfg.Duration, function()
-		isAstral = false
-		if humanoid.Parent and humanoid.Health > 0 then
-			humanoid.WalkSpeed = savedWalkSpeed
-			humanoid.JumpPower = savedJumpPower
-		end
-		if activeAstralClone == clone then
-			clone:Destroy()
-			activeAstralClone = nil
-		end
-	end)
+	playFrozenPlaceholder("Astral")
 end
 
 local function playIllusion()
-	local cfg = ABILITY_CFG.Illusion
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { character }
-
-	local clones = {}
-	for i = 1, cfg.CloneCount do
-		local angle = (i / cfg.CloneCount) * math.pi * 2 + math.random() * 0.5
-		local dist = cfg.SpawnRadius * (0.6 + math.random() * 0.4)
-		local flatOffset = Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
-		local castOrigin = rootPart.Position + flatOffset + Vector3.new(0, 10, 0)
-		local result = workspace:Raycast(castOrigin, Vector3.new(0, -30, 0), params)
-
-		if result then
-			local clone = character:Clone()
-			for _, inst in ipairs(clone:GetDescendants()) do
-				if inst:IsA("Script") or inst:IsA("LocalScript") then
-					inst:Destroy()
-				elseif inst:IsA("BasePart") then
-					inst.CanCollide = false
-					inst.CanTouch = false
-					inst.CanQuery = false
-					inst.Transparency = 0.35
-				end
-			end
-			local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
-			if cloneHumanoid then
-				cloneHumanoid.WalkSpeed = 0
-				cloneHumanoid.JumpPower = 0
-				cloneHumanoid.DisplayName = ""
-			end
-			clone.Name = "IllusionClone"
-			local root = clone:FindFirstChild("HumanoidRootPart")
-			if root then
-				clone:PivotTo(CFrame.new(result.Position) * (root.CFrame - root.CFrame.Position))
-			end
-			clone.Parent = workspace
-			table.insert(clones, clone)
-		end
-	end
-
-	task.delay(cfg.Duration, function()
-		for _, clone in ipairs(clones) do
-			if clone.Parent then
-				clone:Destroy()
-			end
-		end
-	end)
+	playFrozenPlaceholder("Illusion")
 end
 
 local function playUltimate()
@@ -1292,19 +1307,16 @@ handleAbilityInput = function(abilityName)
 		return
 	end
 
+	if freezeDepth > 0 then
+		return
+	end
+
 	if abilityName == "Portal" then
-		if isSelectingPortal then
-			return
-		end
 		if isOnCooldown("Portal") then
 			showMessage("⏳ Portal ainda em recarga", 2)
 			return
 		end
 		startPortalSelection()
-		return
-	end
-
-	if isSelectingPortal or isAstral then
 		return
 	end
 
