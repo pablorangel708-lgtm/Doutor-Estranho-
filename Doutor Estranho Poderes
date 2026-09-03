@@ -95,14 +95,14 @@ local PORTAL_CFG = {
 -- 2) CONFIGURAÇÃO DAS HABILIDADES (cooldown, dano, alcance...)
 ----------------------------------------------------------------
 local ABILITY_CFG = {
-	Portal = { Cooldown = 20 },
-	Shield = { Cooldown = 12, Duration = 6, DamageReduction = 1 },
-	MagicHands = { Cooldown = 3 },
+	Portal = { Cooldown = 5 },
+	Shield = { Cooldown = 5, Duration = 6, DamageReduction = 1 },
+	MagicHands = { Cooldown = 5 },
 	Blast = { Cooldown = 5, Damage = 15, Range = 80, KnockbackForce = 45, MaxAngleDot = 0.5 },
-	Whip = { Cooldown = 6, Damage = 12, Range = 14, Radius = 6, KnockbackForce = 35 },
-	Astral = { Cooldown = 30, Duration = 8 },
-	Illusion = { Cooldown = 20, Duration = 6, CloneCount = 3, SpawnRadius = 10 },
-	Ultimate = { Cooldown = 90, PrepTime = 1.5, Radius = 22, Damage = 35, ImmobilizeTime = 3 },
+	Whip = { Cooldown = 5, Damage = 12, Range = 16, Radius = 7, KnockbackForce = 35 },
+	Astral = { Cooldown = 5 },
+	Illusion = { Cooldown = 5, Duration = 6, CloneCount = 3, SpawnRadius = 10 },
+	Ultimate = { Cooldown = 5, PrepTime = 1.5, Radius = 22, Damage = 35, ImmobilizeTime = 3 },
 }
 
 ----------------------------------------------------------------
@@ -230,6 +230,19 @@ function Effects.EmitBurst(attachment, textureId, count, color)
 	emitter.Parent = attachment
 	emitter:Emit(count)
 	Debris:AddItem(emitter, 1.5)
+end
+
+function Effects.CreateBeam(attachment0, attachment1, color, width)
+	local beam = Instance.new("Beam")
+	beam.Attachment0 = attachment0
+	beam.Attachment1 = attachment1
+	beam.Width0 = width or 0.6
+	beam.Width1 = (width or 0.6) * 0.2
+	beam.Color = ColorSequence.new(color)
+	beam.Transparency = NumberSequence.new(0.1)
+	beam.FaceCamera = true
+	beam.Parent = attachment0
+	return beam
 end
 
 function Effects.CreateImpactBolt(from, to, color, onArrive)
@@ -608,6 +621,8 @@ end
 
 local confirmBtn = makeActionButton("✅ CONFIRMAR", Color3.fromRGB(40, 160, 90), UDim2.new(0.5, -8, 0.92, 0), Vector2.new(1, 1))
 local cancelBtn = makeActionButton("❌ CANCELAR", Color3.fromRGB(170, 50, 50), UDim2.new(0.5, 8, 0.92, 0), Vector2.new(0, 1))
+local returnBtn = makeActionButton("🔙 VOLTAR AO CORPO", Color3.fromRGB(90, 70, 170), UDim2.new(0.5, 0, 0.92, 0), Vector2.new(0.5, 1))
+returnBtn.Visible = false
 
 -- Controles de toque (joystick + subir/descer + arrastar para olhar)
 local joystickVector = Vector2.new(0, 0)
@@ -1058,6 +1073,11 @@ local function startPortalSelection()
 
 	camera.CameraType = Enum.CameraType.Scriptable
 	portalUI.Visible = true
+	title.Text = "🌀 ESCOLHA O DESTINO"
+	statusLabel.Text = ""
+	confirmBtn.Visible = true
+	cancelBtn.Visible = true
+	returnBtn.Visible = false
 	joystickVector = Vector2.new(0, 0)
 	lookDeltaAccum = Vector2.new(0, 0)
 
@@ -1114,8 +1134,18 @@ local function playShield()
 
 	local root = rootPart
 	local part = Effects.CreateCircle(root.CFrame * CFrame.new(0, 0, -3), 6, Color3.fromRGB(120, 200, 255), true, ASSET_IDS.Shield)
-	Effects.AttachTo(part, root, CFrame.new(0, 0, -3), 20)
+	-- spin = 0: o escudo NÃO gira sozinho, só acompanha o personagem
+	-- (Anchored=true + cópia de CFrame via script — fisicamente
+	-- impossível isso afetar o Character/HumanoidRootPart).
+	Effects.AttachTo(part, root, CFrame.new(0, 0, -3), 0)
 	Effects.FadeIn(part, 0.3)
+	for _, decal in ipairs(part:GetChildren()) do
+		if decal:IsA("Decal") then
+			TweenService:Create(decal, TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+				Transparency = 0.45,
+			}):Play()
+		end
+	end
 
 	task.delay(cfg.Duration, function()
 		shieldActive = false
@@ -1192,41 +1222,121 @@ local function playBlast()
 	end)
 end
 
--- Chicote, Astral e Ilusão estão temporariamente DESATIVADOS (a
--- pedido): por enquanto só congelam o personagem (mesmo sistema do
--- Portal) com um efeito visual pequeno. Cooldown e botão continuam
--- normalmente. Nenhum causa dano, cria clone ou move o personagem.
-local FROZEN_PLACEHOLDER_DURATION = {
-	Whip = 1.2,
-	Astral = 3,
-	Illusion = 1.2,
-}
-local FROZEN_PLACEHOLDER_COLOR = {
-	Whip = Color3.fromRGB(255, 120, 60),
-	Astral = Color3.fromRGB(180, 160, 255),
-	Illusion = Color3.fromRGB(200, 160, 255),
-}
-
-local function playFrozenPlaceholder(abilityName)
-	freezeCharacter()
-	if rootPart then
-		Effects.CreateImpactBurst(rootPart.Position, FROZEN_PLACEHOLDER_COLOR[abilityName], ASSET_IDS.MagicCircle)
+local function playWhip()
+	local cfg = ABILITY_CFG.Whip
+	local hand = Effects.GetHand(character, true) or rootPart
+	local aimPoint = getAimTargetPosition(cfg.Range)
+	local direction = (aimPoint - hand.Position)
+	if direction.Magnitude <= 0.01 then
+		direction = rootPart.CFrame.LookVector
 	end
-	task.delay(FROZEN_PLACEHOLDER_DURATION[abilityName], function()
-		unfreezeCharacter()
+	direction = direction.Unit
+	local endPoint = hand.Position + direction * cfg.Range
+
+	-- Attachment 0 acompanha a mão (via script, nunca mexe no personagem);
+	-- Attachment 1 fica fixo na ponta do golpe.
+	local originMount = Instance.new("Part")
+	originMount.Anchored = true
+	originMount.CanCollide = false
+	originMount.CanTouch = false
+	originMount.CanQuery = false
+	originMount.Transparency = 1
+	originMount.Size = Vector3.new(0.2, 0.2, 0.2)
+	originMount.Parent = workspace
+	Effects.AttachTo(originMount, hand, CFrame.new())
+
+	local endMount = Instance.new("Part")
+	endMount.Anchored = true
+	endMount.CanCollide = false
+	endMount.CanTouch = false
+	endMount.CanQuery = false
+	endMount.Transparency = 1
+	endMount.Size = Vector3.new(0.2, 0.2, 0.2)
+	endMount.CFrame = CFrame.new(endPoint)
+	endMount.Parent = workspace
+
+	local a0 = Instance.new("Attachment", originMount)
+	local a1 = Instance.new("Attachment", endMount)
+	local beam = Effects.CreateBeam(a0, a1, Color3.fromRGB(255, 120, 40), 0.7)
+	beam.Width0 = 0.1
+	beam.Width1 = 0.1
+	TweenService:Create(beam, TweenInfo.new(0.1, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Width0 = 0.8 }):Play()
+	TweenService:Create(beam, TweenInfo.new(0.25, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { Width1 = 0.05 }):Play()
+
+	Effects.CreateImpactBurst(endPoint, Color3.fromRGB(255, 120, 40), ASSET_IDS.MagicCircle)
+
+	local targets = getPlayersInRadius(endPoint, cfg.Radius)
+	for _, target in ipairs(targets) do
+		target.Humanoid:TakeDamage(cfg.Damage) -- best-effort (ver aviso no topo do arquivo)
+		local knockDir = Vector3.new(target.RootPart.Position.X - endPoint.X, 0, target.RootPart.Position.Z - endPoint.Z)
+		knockDir = knockDir.Magnitude > 0 and knockDir.Unit or direction
+		-- knockback SOMENTE no alvo atingido; o próprio jogador nunca é tocado aqui
+		target.RootPart.AssemblyLinearVelocity = target.RootPart.AssemblyLinearVelocity
+			+ Vector3.new(knockDir.X, 0.15, knockDir.Z) * cfg.KnockbackForce
+		Effects.CreateImpactBurst(target.RootPart.Position, Color3.fromRGB(255, 90, 30), ASSET_IDS.MagicCircle)
+	end
+
+	task.delay(0.3, function()
+		Effects.Detach(originMount)
+		originMount:Destroy()
+		endMount:Destroy()
 	end)
 end
 
-local function playWhip()
-	playFrozenPlaceholder("Whip")
-end
-
-local function playAstral()
-	playFrozenPlaceholder("Astral")
-end
-
 local function playIllusion()
-	playFrozenPlaceholder("Illusion")
+	local cfg = ABILITY_CFG.Illusion
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+
+	local clones = {}
+	for i = 1, cfg.CloneCount do
+		local angle = (i / cfg.CloneCount) * math.pi * 2 + math.random() * 0.5
+		local dist = cfg.SpawnRadius * (0.6 + math.random() * 0.4)
+		local flatOffset = Vector3.new(math.cos(angle) * dist, 0, math.sin(angle) * dist)
+		local castOrigin = rootPart.Position + flatOffset + Vector3.new(0, 10, 0)
+		local result = workspace:Raycast(castOrigin, Vector3.new(0, -30, 0), params)
+
+		if result then
+			-- Clone puramente visual: sem Script/LocalScript, sem colisão,
+			-- Humanoid parado. Nunca toca no personagem real (character)
+			-- nem no jogador, então o jogador continua se movendo normal.
+			local clone = character:Clone()
+			for _, inst in ipairs(clone:GetDescendants()) do
+				if inst:IsA("Script") or inst:IsA("LocalScript") then
+					inst:Destroy()
+				elseif inst:IsA("BasePart") then
+					inst.CanCollide = false
+					inst.CanTouch = false
+					inst.CanQuery = false
+					inst.Massless = true
+					inst.Transparency = 0.35
+				end
+			end
+			local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
+			if cloneHumanoid then
+				cloneHumanoid.WalkSpeed = 0
+				cloneHumanoid.JumpPower = 0
+				cloneHumanoid.PlatformStand = true
+				cloneHumanoid.DisplayName = ""
+			end
+			clone.Name = "IllusionClone"
+			local root = clone:FindFirstChild("HumanoidRootPart")
+			if root then
+				clone:PivotTo(CFrame.new(result.Position) * (root.CFrame - root.CFrame.Position))
+			end
+			clone.Parent = workspace
+			table.insert(clones, clone)
+		end
+	end
+
+	task.delay(cfg.Duration, function()
+		for _, clone in ipairs(clones) do
+			if clone.Parent then
+				clone:Destroy()
+			end
+		end
+	end)
 end
 
 local function playUltimate()
@@ -1292,18 +1402,198 @@ local function isOnCooldown(abilityName)
 	return endTime ~= nil and endTime > os.clock()
 end
 
+----------------------------------------------------------------
+-- PROJEÇÃO ASTRAL (funcional): o corpo real fica parado (freeze),
+-- uma forma astral visual é criada e a câmera passa a voar com ELA
+-- (reaproveita o mesmo joystick/olhar/subir/descer do Portal). A
+-- forma astral atravessa paredes (CanCollide=false) e nunca causa
+-- dano. O corpo original nunca tem seu CFrame alterado.
+----------------------------------------------------------------
+local isAstralActive = false
+local astralClone = nil
+local astralPosition, astralYaw, astralPitch = Vector3.new(), 0, 0
+local astralSafetyThread = nil
+local ASTRAL_MAX_DURATION = 45 -- segurança: some tempo alguém esquecer de voltar
+
+local function updateAstralMovement(dt)
+	if not astralClone then
+		return
+	end
+	local aRoot = astralClone.PrimaryPart or astralClone:FindFirstChild("HumanoidRootPart")
+	if not aRoot then
+		return
+	end
+
+	local lookDelta = mouseDeltaAccum
+	mouseDeltaAccum = Vector2.new(0, 0)
+	if isTouch then
+		lookDelta += lookDeltaAccum
+		lookDeltaAccum = Vector2.new(0, 0)
+	end
+
+	local sensitivity = PORTAL_CFG.FlyCamLookSensitivity
+	astralYaw = astralYaw - (lookDelta.X * sensitivity * 0.1)
+	astralPitch = math.clamp(astralPitch - (lookDelta.Y * sensitivity * 0.1), -80, 80)
+
+	local yawCFrame = CFrame.Angles(0, math.rad(astralYaw), 0)
+	local fullRotation = yawCFrame * CFrame.Angles(math.rad(astralPitch), 0, 0)
+
+	local moveVector = Vector3.new(0, 0, 0)
+	if isTouch then
+		moveVector += Vector3.new(joystickVector.X, 0, joystickVector.Y)
+	end
+	if isKeyboard then
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveVector += Vector3.new(0, 0, -1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveVector += Vector3.new(0, 0, 1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveVector += Vector3.new(-1, 0, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveVector += Vector3.new(1, 0, 0) end
+	end
+	if moveVector.Magnitude > 1 then
+		moveVector = moveVector.Unit
+	end
+
+	local speed = PORTAL_CFG.FlyCamSpeed * 0.45
+	if isKeyboard and UserInputService:IsKeyDown(FLYCAM_KEYS.Boost) then
+		speed = PORTAL_CFG.FlyCamBoostSpeed * 0.45
+	end
+
+	local vertical = 0
+	if upHeld or (isKeyboard and UserInputService:IsKeyDown(FLYCAM_KEYS.Up)) then
+		vertical += 1
+	end
+	if downHeld or (isKeyboard and UserInputService:IsKeyDown(FLYCAM_KEYS.Down)) then
+		vertical -= 1
+	end
+
+	local worldMove = fullRotation:VectorToWorldSpace(moveVector) * speed * dt
+	worldMove += Vector3.new(0, vertical * PORTAL_CFG.FlyCamVerticalSpeed * 0.45 * dt, 0)
+	astralPosition += worldMove
+
+	-- a forma astral (o clone) só vira no eixo Y — fica sempre "em pé"
+	aRoot.CFrame = CFrame.new(astralPosition) * yawCFrame
+	-- a câmera usa a rotação completa (yaw + pitch) e fica atrás/acima
+	camera.CFrame = CFrame.new(astralPosition) * fullRotation * CFrame.new(0, 2.5, 7)
+end
+
+local function endAstral()
+	if not isAstralActive then
+		return
+	end
+	isAstralActive = false
+
+	if flyConnection then
+		flyConnection:Disconnect()
+		flyConnection = nil
+	end
+	if astralSafetyThread then
+		task.cancel(astralSafetyThread)
+		astralSafetyThread = nil
+	end
+
+	portalUI.Visible = false
+	returnBtn.Visible = false
+	confirmBtn.Visible = true
+	cancelBtn.Visible = true
+
+	camera.CameraType = originalCameraType
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	UserInputService.MouseIconEnabled = true
+
+	if astralClone then
+		local clone = astralClone
+		astralClone = nil
+		local ok, pivot = pcall(function() return clone:GetPivot() end)
+		Effects.CreateImpactBurst(ok and pivot.Position or rootPart.Position, Color3.fromRGB(180, 160, 255), ASSET_IDS.MagicCircle)
+		clone:Destroy()
+	end
+
+	unfreezeCharacter()
+	cooldownEnds["Astral"] = os.clock() + ABILITY_CFG.Astral.Cooldown
+	setCooldown("Astral", ABILITY_CFG.Astral.Cooldown)
+end
+
+local function startAstral()
+	if isAstralActive or not rootPart or humanoid.Health <= 0 then
+		return
+	end
+	isAstralActive = true
+	freezeCharacter()
+
+	local originCFrame = rootPart.CFrame
+
+	local clone = character:Clone()
+	for _, inst in ipairs(clone:GetDescendants()) do
+		if inst:IsA("Script") or inst:IsA("LocalScript") then
+			inst:Destroy()
+		elseif inst:IsA("BasePart") then
+			inst.CanCollide = false -- atravessa paredes/objetos
+			inst.CanTouch = false
+			inst.CanQuery = false
+			inst.Massless = true
+			inst.Transparency = 0.5
+		end
+	end
+	local cloneHumanoid = clone:FindFirstChildOfClass("Humanoid")
+	if cloneHumanoid then
+		cloneHumanoid.WalkSpeed = 0
+		cloneHumanoid.JumpPower = 0
+		cloneHumanoid.PlatformStand = true
+		cloneHumanoid.DisplayName = ""
+	end
+	clone.Name = "AstralProjection"
+	clone:PivotTo(originCFrame)
+	clone.Parent = workspace
+	astralClone = clone
+
+	astralPosition = originCFrame.Position
+	local _, ry = originCFrame:ToOrientation()
+	astralYaw = math.deg(ry)
+	astralPitch = 0
+
+	Effects.CreateImpactBurst(originCFrame.Position, Color3.fromRGB(180, 160, 255), ASSET_IDS.MagicCircle)
+
+	originalCameraType = camera.CameraType
+	camera.CameraType = Enum.CameraType.Scriptable
+	portalUI.Visible = true
+	title.Text = "👻 PROJEÇÃO ASTRAL"
+	statusLabel.Text = "Voando livremente — atravessa paredes"
+	statusLabel.TextColor3 = Color3.fromRGB(180, 160, 255)
+	confirmBtn.Visible = false
+	cancelBtn.Visible = false
+	returnBtn.Visible = true
+	joystickVector = Vector2.new(0, 0)
+	lookDeltaAccum = Vector2.new(0, 0)
+
+	if isKeyboard then
+		UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+		UserInputService.MouseIconEnabled = false
+	end
+
+	flyConnection = RunService.RenderStepped:Connect(updateAstralMovement)
+
+	astralSafetyThread = task.delay(ASTRAL_MAX_DURATION, function()
+		endAstral()
+	end)
+end
+
+returnBtn.Activated:Connect(endAstral)
+
 local abilityFunctions = {
 	Shield = playShield,
 	MagicHands = playMagicHands,
 	Blast = playBlast,
 	Whip = playWhip,
-	Astral = playAstral,
 	Illusion = playIllusion,
 	Ultimate = playUltimate,
 }
 
 handleAbilityInput = function(abilityName)
 	if not character or not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	if abilityName == "Astral" and isAstralActive then
+		endAstral()
 		return
 	end
 
@@ -1317,6 +1607,15 @@ handleAbilityInput = function(abilityName)
 			return
 		end
 		startPortalSelection()
+		return
+	end
+
+	if abilityName == "Astral" then
+		if isOnCooldown("Astral") then
+			showMessage("⏳ Em recarga", 1.2)
+			return
+		end
+		startAstral()
 		return
 	end
 
